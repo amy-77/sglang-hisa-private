@@ -55,6 +55,9 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.nsa import headmap_probe as _headmap_probe
+from sglang.srt.layers.attention.nsa import per_head_paged as _per_head_paged
+from sglang.srt.layers.attention.nsa import offline_unique_head_router as _offline_router
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
@@ -244,6 +247,9 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+
+
+
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -258,6 +264,9 @@ class Indexer(MultiPlatformOp):
                 yield
         else:
             yield
+
+
+
 
     def _weights_proj_bf16_in_fp32_out(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
@@ -283,22 +292,30 @@ class Indexer(MultiPlatformOp):
             return weights
         return weights.float()
 
-    @torch.compile(dynamic=True)
-    def _project_and_scale_head_gates(
-        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
-    ):
-        weights = self._weights_proj_bf16_in_fp32_out(x)
-        weights = weights * self.n_heads**-0.5
-        return weights
+
+
 
     @torch.compile(dynamic=True)
-    def _get_logits_head_gate(
+    def _project_raw_head_gates(
+        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
+    ):
+        return self._weights_proj_bf16_in_fp32_out(x)
+
+
+
+
+    @torch.compile(dynamic=True)
+    def _get_raw_and_logits_head_gate(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: torch.Tensor
     ):
-        weights = self._weights_proj_bf16_in_fp32_out(x)
-        weights = weights * self.n_heads**-0.5
-        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
-        return weights
+        raw_gate = self._weights_proj_bf16_in_fp32_out(x)
+        logits_gate = raw_gate * self.n_heads**-0.5
+        logits_gate = logits_gate.unsqueeze(-1) * q_scale * self.softmax_scale
+        return raw_gate, logits_gate
+
+
+
+
 
     def _get_q_k_bf16(
         self,
@@ -392,6 +409,9 @@ class Indexer(MultiPlatformOp):
             )
         return query, key
 
+
+
+
     def _get_k_bf16(
         self,
         x: torch.Tensor,
@@ -411,6 +431,9 @@ class Indexer(MultiPlatformOp):
 
         return key
 
+
+
+
     @staticmethod
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
         # On AMD with in-place RoPE kernels, self-aliasing can occur;
@@ -419,6 +442,481 @@ class Indexer(MultiPlatformOp):
             return
         dst.copy_(src)
 
+
+
+
+
+    def _per_head_paged_topk(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        row_batch: torch.Tensor,
+        row_len: torch.Tensor,
+        segments: Optional[List[Tuple[int, int, int]]],
+        head_range: Optional[Tuple[int, int]] = None,
+        head_ids: Optional[List[int] | torch.Tensor] = None,
+        coarse_block_ids: Optional[torch.Tensor] = None,
+        coarse_block_size: int = _per_head_paged.MISA_DEFAULT_POOLING_BLOCK,
+        mean_ranked_chunks: bool = False,
+    ) -> torch.Tensor:
+        """Per-head index contract: ``[num_tokens, G, topk]`` request-relative
+        token positions for this rank's G indexer heads (see per_head_paged).
+        Rows beyond the real queries (TP / DP padding) are ``-1``.
+        """
+        if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "SGLANG_NSA_PER_HEAD_INDEX=1 requires --disable-cuda-graph"
+            )
+        pool = forward_batch.token_to_kv_pool
+        assert pool.page_size == 64, "per-head paged indexer needs page size 64"
+        if head_ids is None:
+            h0, h1 = (
+                _per_head_paged.local_head_range(self.n_heads)
+                if head_range is None
+                else head_range
+            )
+            output_heads = h1 - h0
+        else:
+            if head_range is not None:
+                raise ValueError("head_range and head_ids are mutually exclusive")
+            h0 = h1 = 0
+            output_heads = (
+                int(head_ids.shape[-1])
+                if isinstance(head_ids, torch.Tensor)
+                else len(head_ids)
+            )
+        q_offset = row_len.shape[0]
+
+        picks = _per_head_paged.per_head_topk_paged(
+            q_fp8[:q_offset],
+            (h0, h1) if head_ids is None else None,
+            pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+            pool.get_index_k_chunk_sum(layer_id),
+            metadata.get_page_table_64(),
+            row_batch,
+            row_len,
+            self.index_topk,
+            head_ids=head_ids,
+            coarse_block_ids=coarse_block_ids,
+            coarse_block_size=coarse_block_size,
+            mean_ranked_chunks=mean_ranked_chunks,
+            segments=segments,
+        )
+
+        if q_offset < q_fp8.shape[0]:
+            pad = torch.full(
+                (q_fp8.shape[0] - q_offset, output_heads, self.index_topk),
+                -1,
+                dtype=picks.dtype,
+                device=picks.device,
+            )
+            picks = torch.cat([picks, pad], dim=0)
+        return picks
+
+    def _static_group16_coarse_blocks(
+        self,
+        *,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        chunk_sum: torch.Tensor,
+        block_tables: torch.Tensor,
+        row_batch: torch.Tensor,
+        row_len: torch.Tensor,
+        head_ids: Tuple[int, ...],
+    ) -> torch.Tensor:
+        """Score coarse regions for one frozen Indexer, never all 64 heads."""
+        if len(head_ids) != 1:
+            raise ValueError(
+                f"static Group16 expects one rank-local Indexer, got {head_ids}"
+            )
+        static_ids = torch.as_tensor(
+            head_ids, dtype=torch.long, device=q.device
+        )
+        selection = _per_head_paged.misa_topk_heads_paged(
+            q.to(torch.bfloat16).index_select(1, static_ids),
+            weights.index_select(1, static_ids),
+            chunk_sum,
+            block_tables,
+            row_batch,
+            row_len,
+            1,
+            pooling_block_size=_offline_router.misa_chunk_size(),
+            prune_topk=_offline_router.misa_prune_topk(),
+            prune_keep_fraction=_offline_router.misa_prune_keep_fraction(),
+            return_metadata=True,
+        )
+        assert isinstance(selection, _per_head_paged.MISASelection)
+        return selection.coarse_block_ids
+
+    @staticmethod
+    def _early_prefill_rows(
+        forward_batch: ForwardBatch,
+        metadata: BaseIndexerMetadata,
+        min_seq_len: int,
+    ) -> Tuple[List[int], int]:
+        """Count the dense-warmup rows at the head of each prefill segment.
+
+        A prefill row's visible prefix grows monotonically inside its request, so
+        the rows below ``min_seq_len`` are always a prefix of that request's
+        segment.  Deriving the counts from the CPU-side extend metadata keeps the
+        boundary decision off the critical path: no device synchronisation.
+        Returns the per-segment counts and the longest dense prefix seen.
+        """
+        assert forward_batch.seq_lens_cpu is not None
+        seq_lens = forward_batch.seq_lens_cpu.tolist()
+        counts: List[int] = []
+        widest = 0
+        for b, extend_len in enumerate(metadata.get_nsa_extend_len_cpu()):
+            extend_len = int(extend_len)
+            cached = int(seq_lens[b]) - extend_len
+            count = min(max(min_seq_len - 1 - cached, 0), extend_len)
+            counts.append(count)
+            if count:
+                widest = max(widest, cached + count)
+        return counts, widest
+
+
+
+
+
+
+    def _per_head_ragged_topk(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        row_batch: torch.Tensor,
+        row_len: torch.Tensor,
+        segments: List[Tuple[int, int, int]],
+        *,
+        router_heads: Optional[Any],
+        router_uses_misa: bool,
+    ) -> torch.Tensor:
+        """Prefill picks under the decode policy.
+
+        Every prefill row is one query with its own causal prefix, so the sparse
+        threshold, the dynamic MISA head set and the coarse pruning are all
+        evaluated per row exactly as decode evaluates them per request.  Returns
+        ``[num_tokens, G, width]`` request-relative positions, where G is the
+        MISA budget under the router and this rank's local head count otherwise.
+        """
+        nq = row_len.shape[0]
+        total_rows = q_fp8.shape[0]
+        device = q_fp8.device
+        h0, h1 = _per_head_paged.local_head_range(self.n_heads)
+        local_pairs = h1 - h0
+        if router_heads is not None:
+            # Sparse rows carry M candidate lists for the router to assign;
+            # dense rows carry one final list per local pair.
+            heads = _offline_router.budget()
+            min_seq_len = _offline_router.min_seq_len()
+        else:
+            heads = local_pairs
+            min_seq_len = _per_head_paged.per_head_min_seq_len()
+
+        early_counts, dense_width = self._early_prefill_rows(
+            forward_batch, metadata, min_seq_len
+        )
+        n_early = sum(early_counts)
+        if layer_id == 0 and _per_head_paged.trace_prefill_enabled():
+            print(
+                "[experimental_prefill_per_head] "
+                f"rows={nq} dense_rows={n_early} dense_width={dense_width} "
+                f"min_seq_len={min_seq_len} heads={heads} "
+                f"misa={router_uses_misa}",
+                flush=True,
+            )
+
+        def dense_table(width: int) -> torch.Tensor:
+            """``[total_rows, width]`` every visible key, shared across heads."""
+            lens = row_len.to(torch.int32)
+            if nq < total_rows:
+                lens = torch.cat(
+                    [
+                        lens,
+                        torch.zeros(
+                            total_rows - nq, dtype=torch.int32, device=device
+                        ),
+                    ]
+                )
+            ids = torch.arange(width, dtype=torch.int32, device=device)
+            return torch.where(ids.view(1, -1) < lens.view(-1, 1), ids.view(1, -1), -1)
+
+        if n_early == nq:
+            # The whole chunk is still below the threshold, so the Assignment
+            # Router is bypassed just as it is on dense decode.
+            width = _per_head_paged.pad_index_width(dense_width)
+            if router_heads is not None:
+                _offline_router.mark_router_bypassed(forward_batch, layer_id)
+            return dense_table(width).unsqueeze(1).expand(-1, local_pairs, -1)
+
+        coarse_block_ids = None
+        misa_selection = None
+        head_ids: Optional[Union[torch.Tensor, List[int]]] = None
+        router_uses_static_group16 = (
+            router_heads is not None and _offline_router.static_group16_enabled()
+        )
+        if router_uses_misa:
+            misa_selection = _per_head_paged.misa_topk_heads_paged(
+                q_fp8[:nq],
+                weights[:nq],
+                forward_batch.token_to_kv_pool.get_index_k_chunk_sum(layer_id),
+                metadata.get_page_table_64(),
+                row_batch,
+                row_len,
+                _offline_router.budget(),
+                pooling_block_size=_offline_router.misa_chunk_size(),
+                prune_topk=_offline_router.misa_prune_topk(),
+                prune_keep_fraction=_offline_router.misa_prune_keep_fraction(),
+                return_metadata=True,
+            )
+            assert isinstance(misa_selection, _per_head_paged.MISASelection)
+            head_ids = misa_selection.candidate_head_ids
+            coarse_block_ids = misa_selection.coarse_block_ids
+        elif router_uses_static_group16:
+            head_ids = list(router_heads)
+            coarse_block_ids = self._static_group16_coarse_blocks(
+                q=q_fp8[:nq],
+                weights=weights[:nq],
+                chunk_sum=forward_batch.token_to_kv_pool.get_index_k_chunk_sum(
+                    layer_id
+                ),
+                block_tables=metadata.get_page_table_64(),
+                row_batch=row_batch,
+                row_len=row_len,
+                head_ids=router_heads,
+            )
+        elif router_heads is not None:
+            head_ids = list(router_heads)
+
+
+        picks = self._per_head_paged_topk(
+            forward_batch,
+            layer_id,
+            q_fp8,
+            metadata,
+            row_batch,
+            row_len,
+            segments,
+            head_ids=head_ids,
+            coarse_block_ids=coarse_block_ids,
+            mean_ranked_chunks=(
+                (router_uses_misa or router_uses_static_group16)
+                and _offline_router.misa_prune_topk() is not None
+            ),
+            coarse_block_size=(
+                _offline_router.misa_chunk_size()
+                if coarse_block_ids is not None
+                else _per_head_paged.MISA_DEFAULT_POOLING_BLOCK
+            ),
+        )
+
+        if (
+            router_heads is not None
+            and _offline_router.assignment_mode() == "learned"
+        ):
+            _offline_router.stash_gate(forward_batch, layer_id, weights)
+            if router_uses_misa:
+                assert isinstance(head_ids, torch.Tensor)
+                assert misa_selection is not None
+                _offline_router.stash_selected_heads(
+                    forward_batch, layer_id, head_ids, total_rows=picks.shape[0]
+                )
+                _offline_router.stash_misa_features(
+                    forward_batch,
+                    layer_id,
+                    q_fp8[:nq],
+                    weights[:nq],
+                    misa_selection,
+                    total_rows=picks.shape[0],
+                )
+
+        if not n_early:
+            return picks
+
+        # Mixed chunk: attention takes one index width for the whole batch, so
+        # widen the sparse table and swap the dense rows in.
+        width = _per_head_paged.pad_index_width(max(picks.shape[-1], dense_width))
+        if picks.shape[-1] < width:
+            picks = torch.cat(
+                [
+                    picks,
+                    torch.full(
+                        (picks.shape[0], heads, width - picks.shape[-1]),
+                        -1,
+                        dtype=picks.dtype,
+                        device=picks.device,
+                    ),
+                ],
+                dim=-1,
+            )
+        early_mask = torch.zeros(picks.shape[0], dtype=torch.bool, device=device)
+        for (start, _end, _req), count in zip(segments, early_counts):
+            if count:
+                early_mask[start : start + count] = True
+        return torch.where(
+            early_mask.view(-1, 1, 1),
+            dense_table(width).unsqueeze(1).expand(-1, heads, -1),
+            picks,
+        )
+
+
+
+
+
+
+    def _prepare_group16_all64_probe(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        seqlens_32: torch.Tensor,
+        raw_query: torch.Tensor,
+        raw_gate: torch.Tensor,
+    ) -> None:
+        """Prepare one identified candidate set for the Group16 teacher."""
+        identity = _headmap_probe.request_info(forward_batch)
+        if (
+            not _headmap_probe.enabled()
+            or identity is None
+            or not _headmap_probe.wants_layer(layer_id)
+            or not _headmap_probe.wants_sample(layer_id)
+            or not forward_batch.forward_mode.is_decode_or_idle()
+            or seqlens_32.numel() != 1
+            or int(seqlens_32.reshape(-1)[0].item())
+            != identity.expected_seq_len
+        ):
+            return
+
+        row_batch = torch.zeros(1, dtype=torch.int32, device=q_fp8.device)
+        chunk_sum = (
+            forward_batch.token_to_kv_pool.get_index_k_chunk_sum(layer_id)
+        )
+        page_table = metadata.get_page_table_64()
+        row_len = seqlens_32.reshape(-1)[:1]
+        importance_variants: dict[str, torch.Tensor] = {}
+        selection = _per_head_paged.misa_topk_heads_paged(
+            q_fp8.squeeze(1)[:1],
+            weights[:1],
+            chunk_sum,
+            page_table,
+            row_batch,
+            row_len,
+            _headmap_probe.candidate_budget(),
+            pooling_block_size=_headmap_probe.pooling_block_size(),
+            prune_keep_fraction=_headmap_probe.prune_keep_fraction(),
+            prune_topk=_headmap_probe.prune_topk(),
+            return_metadata=True,
+            importance_variant_output=importance_variants,
+        )
+        assert isinstance(selection, _per_head_paged.MISASelection)
+        if selection.candidate_head_ids.shape[1] == q_fp8.shape[2]:
+            # All-64 collection has no head-selection stage. Canonicalize the
+            # candidate axis so every TP rank writes IDs in exact 0..63 order.
+            order = selection.candidate_head_ids.argsort(dim=1)
+
+            def gather_candidate(value: torch.Tensor) -> torch.Tensor:
+                index = order
+                while index.ndim < value.ndim:
+                    index = index.unsqueeze(-1)
+                return torch.gather(value, 1, index.expand_as(value))
+
+            selection = _per_head_paged.MISASelection(
+                candidate_head_ids=gather_candidate(
+                    selection.candidate_head_ids
+                ),
+                coarse_block_ids=gather_candidate(selection.coarse_block_ids),
+                candidate_importance=gather_candidate(
+                    selection.candidate_importance
+                ),
+                candidate_context_summary=gather_candidate(
+                    selection.candidate_context_summary
+                ),
+                candidate_context_stats=gather_candidate(
+                    selection.candidate_context_stats
+                ),
+            )
+
+        candidate_top8_sum = None
+        candidate_top8_context_summary = None
+        if _headmap_probe.save_group_router_features():
+            router_variants: dict[str, torch.Tensor] = {}
+            router_selection = _per_head_paged.misa_topk_heads_paged(
+                raw_query[:1],
+                raw_gate[:1],
+                chunk_sum,
+                page_table,
+                row_batch,
+                row_len,
+                raw_query.shape[1],
+                pooling_block_size=256,
+                prune_topk=8,
+                return_metadata=True,
+                importance_variant_output=router_variants,
+            )
+            assert isinstance(router_selection, _per_head_paged.MISASelection)
+            primary_ids = selection.candidate_head_ids
+            candidate_top8_sum = torch.gather(
+                router_variants["raw_top_count_8"], 1, primary_ids
+            )
+            inverse_slots = torch.empty_like(router_selection.candidate_head_ids)
+            inverse_slots.scatter_(
+                1,
+                router_selection.candidate_head_ids,
+                torch.arange(
+                    router_selection.candidate_head_ids.shape[1],
+                    device=q_fp8.device,
+                ).view(1, -1),
+            )
+            router_slots = torch.gather(inverse_slots, 1, primary_ids)
+            candidate_top8_context_summary = torch.gather(
+                router_selection.candidate_context_summary,
+                1,
+                router_slots.unsqueeze(-1).expand(
+                    -1,
+                    -1,
+                    router_selection.candidate_context_summary.shape[-1],
+                ),
+            )
+
+        picks = self._per_head_paged_topk(
+            forward_batch,
+            layer_id,
+            q_fp8.squeeze(1),
+            metadata,
+            row_batch,
+            row_len,
+            None,
+            head_ids=selection.candidate_head_ids,
+            coarse_block_ids=selection.coarse_block_ids,
+            coarse_block_size=_headmap_probe.pooling_block_size(),
+            mean_ranked_chunks=_headmap_probe.prune_topk() is not None,
+        )
+        _headmap_probe.put_picks(
+            layer_id,
+            picks,
+            request_id=identity.request_id,
+            all_indexer_q=raw_query,
+            all_indexer_gate=raw_gate,
+            candidate_head_ids=selection.candidate_head_ids,
+            candidate_importance=selection.candidate_importance,
+            candidate_context_summary=selection.candidate_context_summary,
+            candidate_context_stats=selection.candidate_context_stats,
+            candidate_top8_sum=candidate_top8_sum,
+            candidate_top8_context_summary=candidate_top8_context_summary,
+            importance_variants=importance_variants,
+        )
+
+
+
+
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -426,9 +924,265 @@ class Indexer(MultiPlatformOp):
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
+        raw_query: torch.Tensor,
+        raw_gate: torch.Tensor,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+
+        per_head_enabled = _per_head_paged.per_head_index_enabled() and not _is_hip
+        router_heads = (
+            _offline_router.candidate_head_ids(layer_id) if not _is_hip else None
+        )
+        router_uses_misa = (
+            router_heads is not None and _offline_router.head_selection_mode() == "misa"
+        )
+        router_uses_static_group16 = (
+            router_heads is not None and _offline_router.static_group16_enabled()
+        )
+        if router_heads is not None and per_head_enabled:
+            raise RuntimeError(
+                "offline unique-head router and fixed per-head index mode cannot "
+                "be enabled together"
+            )
+
+        experimental_picks = None
+        experimental_early_mask = None
+        all_late = True
+        all_early = False
+        if per_head_enabled or router_heads is not None:
+            if not forward_batch.forward_mode.is_decode_or_idle():
+                raise NotImplementedError(
+                    "experimental paged indexer: speculative decoding is not supported"
+                )
+            seqlens = metadata.get_seqlens_int32()
+            bsz = seqlens.shape[0]
+            decode_start = _per_head_paged.per_head_decode_start_token()
+            min_seq_len = (
+                _offline_router.min_seq_len()
+                if router_heads is not None
+                else _per_head_paged.per_head_min_seq_len()
+            )
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            if seq_lens_cpu is None or len(seq_lens_cpu) != bsz:
+                raise RuntimeError(
+                    "seq_lens_cpu and indexer batch size disagree: "
+                    f"{None if seq_lens_cpu is None else len(seq_lens_cpu)} != {bsz}"
+                )
+            generated_lens = forward_batch.generated_lens_cpu
+            if decode_start > 0:
+                if generated_lens is None:
+                    raise RuntimeError(
+                        "SGLANG_NSA_EXPERIMENTAL_DECODE_START_TOKEN requires "
+                        "ForwardBatch.generated_lens_cpu"
+                    )
+                if len(generated_lens) != bsz:
+                    raise RuntimeError(
+                        "generated_lens_cpu and indexer batch size disagree: "
+                        f"{len(generated_lens)} != {bsz}"
+                    )
+            early_flags = [
+                seq_len < min_seq_len
+                or (
+                    decode_start > 0
+                    and generated_lens is not None
+                    and generated_len < decode_start
+                )
+                for seq_len, generated_len in zip(
+                    seq_lens_cpu,
+                    generated_lens if generated_lens is not None else [0] * bsz,
+                )
+            ]
+            all_late = not any(early_flags)
+            all_early = all(early_flags)
+            # Emit an auditable, low-volume marker at either policy boundary.
+            # Restricting this to layer 0 avoids 61 log lines per worker.
+            if layer_id == 0 and (
+                any(length == min_seq_len for length in seq_lens_cpu)
+                or (
+                    decode_start > 0
+                    and generated_lens is not None
+                    and any(length == decode_start for length in generated_lens)
+                )
+            ):
+                print(
+                    "[experimental_sparse_transition] "
+                    f"min_seq_len={min_seq_len} decode_start={decode_start} "
+                    f"seq_lens={seq_lens_cpu} generated_lens={generated_lens} "
+                    f"early={early_flags}",
+                    flush=True,
+                )
+            # Avoid a GPU allocation in the common all-early/all-late cases.
+            if not all_late and not all_early:
+                experimental_early_mask = torch.tensor(
+                    early_flags,
+                    dtype=torch.bool,
+                    device=seqlens.device,
+                )
+
+            if all_early:
+                # True dense warmup: before the sparse threshold, return every
+                # visible request-relative key rather than the model's shared
+                # Top-K (2048).  The list is shared across heads, so the
+                # Assignment Router is intentionally bypassed, but it is still
+                # emitted on the per-head contract because only that attention
+                # path accepts a width other than index_topk.
+                width = _per_head_paged.pad_index_width(
+                    max(int(length) for length in seq_lens_cpu)
+                )
+                token_ids = torch.arange(
+                    width, dtype=torch.int32, device=seqlens.device
+                )
+                full_indices = torch.where(
+                    token_ids.view(1, -1) < seqlens.view(-1, 1),
+                    token_ids.view(1, -1),
+                    -1,
+                )
+                if bsz < q_fp8.shape[0]:
+                    full_indices = torch.cat(
+                        [
+                            full_indices,
+                            torch.full(
+                                (q_fp8.shape[0] - bsz, width),
+                                -1,
+                                dtype=torch.int32,
+                                device=seqlens.device,
+                            ),
+                        ],
+                        dim=0,
+                    )
+                # The head axis is this rank's local pair count, not the MISA
+                # budget: these are already final per-pair indices, so routing
+                # must be skipped rather than fed 8 identical candidate lists.
+                h0, h1 = _per_head_paged.local_head_range(self.n_heads)
+                if router_heads is not None:
+                    _offline_router.mark_router_bypassed(forward_batch, layer_id)
+                return full_indices.unsqueeze(1).expand(-1, h1 - h0, -1)
+
+            # With no delay, or once every request crossed the delay, retain
+            # the original fast path and avoid computing the official shared
+            # selector.  If every request is still early, fall through to the
+            # shared selector below.  A mixed batch computes both policies and
+            # merges per row after the shared result is available.
+            coarse_block_ids = None
+            misa_selection = None
+            if router_uses_misa and not all_early:
+                misa_selection = _per_head_paged.misa_topk_heads_paged(
+                    q_fp8[:bsz],
+                    weights[:bsz],
+                    forward_batch.token_to_kv_pool.get_index_k_chunk_sum(layer_id),
+                    metadata.get_page_table_64(),
+                    torch.arange(bsz, device=seqlens.device, dtype=torch.int32),
+                    seqlens,
+                    _offline_router.budget(),
+                    pooling_block_size=_offline_router.misa_chunk_size(),
+                    prune_topk=_offline_router.misa_prune_topk(),
+                    prune_keep_fraction=_offline_router.misa_prune_keep_fraction(),
+                    return_metadata=True,
+                )
+                assert isinstance(misa_selection, _per_head_paged.MISASelection)
+                head_ids = misa_selection.candidate_head_ids
+                coarse_block_ids = misa_selection.coarse_block_ids
+            elif router_uses_static_group16 and not all_early:
+                # Score coarse blocks for this rank's one frozen Indexer only.
+                # Passing all 64 heads here would erase the Static speedup.
+                head_ids = list(router_heads)
+                coarse_block_ids = self._static_group16_coarse_blocks(
+                    q=q_fp8[:bsz],
+                    weights=weights[:bsz],
+                    chunk_sum=forward_batch.token_to_kv_pool.get_index_k_chunk_sum(
+                        layer_id
+                    ),
+                    block_tables=metadata.get_page_table_64(),
+                    row_batch=torch.arange(
+                        bsz, device=seqlens.device, dtype=torch.int32
+                    ),
+                    row_len=seqlens,
+                    head_ids=router_heads,
+                )
+            elif router_uses_misa:
+                head_ids = None
+            else:
+                head_ids = list(router_heads) if router_heads is not None else None
+            if all_late:
+                picks = self._per_head_paged_topk(
+                    forward_batch,
+                    layer_id,
+                    q_fp8,
+                    metadata,
+                    torch.arange(bsz, device=seqlens.device, dtype=torch.int32),
+                    seqlens,
+                    None,
+                    head_ids=head_ids,
+                    coarse_block_ids=coarse_block_ids,
+                    coarse_block_size=_offline_router.misa_chunk_size(),
+                    mean_ranked_chunks=(
+                        (router_uses_misa or router_uses_static_group16)
+                        and _offline_router.misa_prune_topk() is not None
+                    ),
+                )
+                if (
+                    router_heads is not None
+                    and _offline_router.assignment_mode() == "learned"
+                ):
+                    _offline_router.stash_gate(forward_batch, layer_id, weights)
+                    if router_uses_misa:
+                        assert isinstance(head_ids, torch.Tensor)
+                        assert misa_selection is not None
+                        _offline_router.stash_selected_heads(
+                            forward_batch,
+                            layer_id,
+                            head_ids,
+                            total_rows=picks.shape[0],
+                        )
+                        _offline_router.stash_misa_features(
+                            forward_batch,
+                            layer_id,
+                            q_fp8[:bsz],
+                            weights[:bsz],
+                            misa_selection,
+                            total_rows=picks.shape[0],
+                        )
+                return picks
+            if not all_early:
+                experimental_picks = self._per_head_paged_topk(
+                    forward_batch,
+                    layer_id,
+                    q_fp8,
+                    metadata,
+                    torch.arange(bsz, device=seqlens.device, dtype=torch.int32),
+                    seqlens,
+                    None,
+                    head_ids=head_ids,
+                    coarse_block_ids=coarse_block_ids,
+                    coarse_block_size=_offline_router.misa_chunk_size(),
+                    mean_ranked_chunks=(
+                        (router_uses_misa or router_uses_static_group16)
+                        and _offline_router.misa_prune_topk() is not None
+                    ),
+                )
+                if (
+                    router_heads is not None
+                    and _offline_router.assignment_mode() == "learned"
+                ):
+                    _offline_router.stash_gate(forward_batch, layer_id, weights)
+                    if router_uses_misa:
+                        assert isinstance(head_ids, torch.Tensor)
+                        assert misa_selection is not None
+                        _offline_router.stash_selected_heads(
+                            forward_batch,
+                            layer_id,
+                            head_ids,
+                            total_rows=experimental_picks.shape[0],
+                        )
+                        _offline_router.stash_misa_features(
+                            forward_batch,
+                            layer_id,
+                            q_fp8[:bsz],
+                            weights[:bsz],
+                            misa_selection,
+                            total_rows=experimental_picks.shape[0],
+                        )
 
         page_size = forward_batch.token_to_kv_pool.page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
@@ -453,13 +1207,13 @@ class Indexer(MultiPlatformOp):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
-        # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
-        # otherwise fall back to computing it here.
+
+        # Reuse pre-computed schedule metadata if available (from init_forward_metadata), otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
         # DeepGEMM release-0426 requires context_lens of shape [batch_size, next_n]
         # to match q.shape = [batch_size, next_n, heads, head_dim]. The indexer uses
-        # next_n=1 with batch_size=N_total via q_fp8.unsqueeze(1) below, so mirror
-        # that layout here.
+        # next_n=1 with batch_size=N_total via q_fp8.unsqueeze(1) below, so mirror that layout here.
+
         if seqlens_32.dim() == 2:
             seqlens_32_2d = seqlens_32
         else:
@@ -467,8 +1221,7 @@ class Indexer(MultiPlatformOp):
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, blocksize, self.sm_count
-                )
+                    seqlens_32_2d, blocksize, self.sm_count)
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
@@ -535,7 +1288,84 @@ class Indexer(MultiPlatformOp):
                 device=topk_result.device,
             )
             topk_result = torch.cat([topk_result, padding], dim=0)
+        if experimental_picks is not None:
+            # Attention accepts a single rank for the whole batch.  Promote
+            # every visible key to the per-head contract for early rows, while
+            # retaining sparse per-head picks for requests past the threshold.
+            assert experimental_early_mask is not None
+            g = experimental_picks.shape[1]
+            if experimental_early_mask.shape[0] < topk_result.shape[0]:
+                padding = torch.ones(
+                    topk_result.shape[0] - experimental_early_mask.shape[0],
+                    dtype=torch.bool,
+                    device=experimental_early_mask.device,
+                )
+                experimental_early_mask = torch.cat(
+                    [experimental_early_mask, padding], dim=0
+                )
+            dense_width = _per_head_paged.pad_index_width(
+                max(
+                    experimental_picks.shape[-1],
+                    max(
+                        int(length)
+                        for length, early in zip(seq_lens_cpu, early_flags)
+                        if early
+                    ),
+                )
+            )
+            dense_ids = torch.arange(
+                dense_width, dtype=torch.int32, device=topk_result.device
+            )
+            dense_shared = torch.full(
+                (topk_result.shape[0], dense_width),
+                -1,
+                dtype=torch.int32,
+                device=topk_result.device,
+            )
+            dense_shared[:bsz] = torch.where(
+                dense_ids.view(1, -1) < seqlens.view(-1, 1),
+                dense_ids.view(1, -1),
+                -1,
+            )
+            dense_per_head = dense_shared.unsqueeze(1).expand(-1, g, -1)
+            if experimental_picks.shape[-1] < dense_width:
+                experimental_picks = torch.cat(
+                    [
+                        experimental_picks,
+                        torch.full(
+                            (
+                                experimental_picks.shape[0],
+                                g,
+                                dense_width - experimental_picks.shape[-1],
+                            ),
+                            -1,
+                            dtype=experimental_picks.dtype,
+                            device=experimental_picks.device,
+                        ),
+                    ],
+                    dim=-1,
+                )
+            topk_result = torch.where(
+                experimental_early_mask.view(-1, 1, 1),
+                dense_per_head,
+                experimental_picks,
+            )
+
+        self._prepare_group16_all64_probe(
+            forward_batch,
+            layer_id,
+            q_fp8,
+            weights,
+            metadata,
+            seqlens_32,
+            raw_query,
+            raw_gate,
+        )
         return topk_result
+
+
+
+
 
     def _should_chunk_mqa_logits(
         self, num_q: int, num_k: int, device: torch.device
@@ -556,6 +1386,10 @@ class Indexer(MultiPlatformOp):
         need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
         return need_chunk, free_mem
 
+
+
+
+    # prefill入口
     def _get_topk_ragged(
         self,
         enable_dual_stream: bool,
@@ -567,9 +1401,7 @@ class Indexer(MultiPlatformOp):
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
-
         assert forward_batch.forward_mode.is_extend_without_speculative()
-
         page_size = forward_batch.token_to_kv_pool.page_size
         if _is_hip:
             assert page_size == 1, "only support page size 1"
@@ -596,18 +1428,67 @@ class Indexer(MultiPlatformOp):
         batch_size = len(block_tables)
         token_nums, _, _ = q_fp8.shape
         device = q_fp8.device
+        per_head = _per_head_paged.per_head_index_enabled() and not _is_hip
+        router_heads = (
+            _offline_router.candidate_head_ids(layer_id) if not _is_hip else None
+        )
+        router_uses_misa = (
+            router_heads is not None and _offline_router.head_selection_mode() == "misa"
+        )
+        if router_heads is not None and per_head:
+            raise RuntimeError(
+                "offline unique-head router and fixed per-head index mode cannot "
+                "be enabled together"
+            )
+        if not _per_head_paged.prefill_per_head_enabled():
+            # Decode-only configuration: prefill keeps the official shared
+            # selector, so fall through to the baseline path below.
+            per_head = False
+            router_heads = None
+            router_uses_misa = False
+
+        if batch_size == 0:
+            shape = (token_nums, self.index_topk)
+            if per_head:
+                h0, h1 = _per_head_paged.local_head_range(self.n_heads)
+                shape = (token_nums, h1 - h0, self.index_topk)
+            elif router_heads is not None:
+                shape = (token_nums, _offline_router.budget(), self.index_topk)
+            return torch.full(shape, -1, device=device, dtype=torch.int32)
+
+        if per_head or router_heads is not None:
+            # Paged per-head path: no K gather, no packed-buffer chunking.
+            row_len = metadata.get_seqlens_expanded()  # position + 1 per query
+            segments = []
+            start = 0
+            for b, n in enumerate(metadata.get_nsa_extend_len_cpu()):
+                segments.append((start, start + n, b))
+                start += n
+
+            return self._per_head_ragged_topk(
+                forward_batch,
+                layer_id,
+                q_fp8,
+                weights,
+                metadata,
+                metadata.get_token_to_batch_idx(),
+                row_len,
+                segments,
+                router_heads=router_heads,
+                router_uses_misa=router_uses_misa,
+            )
 
         topk_result = torch.full(
-            (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
+            (token_nums, self.index_topk),
+            -1,
+            device=device,
+            dtype=torch.int32,
         )
-        if batch_size == 0:
-            return topk_result
-
         ks, ke = metadata.get_indexer_kvcache_range()
-
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
+
         k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
             layer_id,
             metadata.get_indexer_seq_len(),
@@ -615,6 +1496,7 @@ class Indexer(MultiPlatformOp):
             seq_len_sum,
             max_seq_len,
         )
+
         if _is_fp8_fnuz:
             k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
         else:
@@ -628,6 +1510,10 @@ class Indexer(MultiPlatformOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+
+
+        # Baseline DSA: use one logits call when memory allows, otherwise run
+        # the same algorithm in row chunks.
         need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
 
         if not need_chunk:
@@ -637,21 +1523,12 @@ class Indexer(MultiPlatformOp):
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
-                    logits = fp8_mqa_logits(
-                        q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
-                    )
+                    logits = fp8_mqa_logits(q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke)
                 else:
-                    logits = deep_gemm.fp8_mqa_logits(
-                        q_fp8[:q_offset],
-                        kv_fp8,
-                        weights[:q_offset],
-                        ks,
-                        ke,
-                        clean_logits=False,
-                    )
+                    logits = deep_gemm.fp8_mqa_logits(q_fp8[:q_offset], kv_fp8, weights[:q_offset], ks, ke, clean_logits=False)
+
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
-
             raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
             topk_result[:q_offset] = raw_topk_result
             return topk_result
@@ -690,6 +1567,7 @@ class Indexer(MultiPlatformOp):
                         ks[start:end],
                         ke[start:end],
                     )
+
                 else:
                     logits_chunk = deep_gemm.fp8_mqa_logits(
                         q_fp8[start:end],
@@ -730,6 +1608,12 @@ class Indexer(MultiPlatformOp):
             start = end
 
         return topk_result
+
+
+
+
+
+
 
     def _forward_cuda_k_only(
         self,
@@ -772,6 +1656,9 @@ class Indexer(MultiPlatformOp):
             device=x_meta.device,
         )
         return metadata.topk_transform(dummy_logits, self.index_topk)
+
+
+
 
     def _get_topk_ragged_with_cp(
         self,
@@ -922,6 +1809,8 @@ class Indexer(MultiPlatformOp):
 
         return topk_result
 
+
+
     def forward_indexer(
         self,
         q_fp8: torch.Tensor,
@@ -1040,6 +1929,17 @@ class Indexer(MultiPlatformOp):
                 forward_batch.out_cache_loc,
                 forward_batch.token_to_kv_pool.page_size,
             )
+            if (
+                _per_head_paged.per_head_index_enabled()
+                or _offline_router.candidate_head_ids(layer_id) is not None
+                or (
+                    _headmap_probe.enabled()
+                    and _headmap_probe.wants_layer(layer_id)
+                )
+            ):
+                forward_batch.token_to_kv_pool.update_index_k_chunk_sum(
+                    layer_id, key, forward_batch.out_cache_loc
+                )
             return
 
         # Fast path: AITER fused quant + cache store (HIP, page_size=1)
@@ -1072,6 +1972,17 @@ class Indexer(MultiPlatformOp):
             index_k=k_fp8,
             index_k_scale=k_scale,
         )
+        if (
+            _per_head_paged.per_head_index_enabled()
+            or _offline_router.candidate_head_ids(layer_id) is not None
+            or (
+                _headmap_probe.enabled()
+                and _headmap_probe.wants_layer(layer_id)
+            )
+        ):
+            forward_batch.token_to_kv_pool.update_index_k_chunk_sum(
+                layer_id, key, out_loc
+            )
 
     def forward_xpu(
         self,
@@ -1107,9 +2018,7 @@ class Indexer(MultiPlatformOp):
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
         x_meta = x[0] if isinstance(x, tuple) else x
 
-        metadata = forward_batch.attn_backend.get_indexer_metadata(
-            layer_id, forward_batch
-        )
+        metadata = forward_batch.attn_backend.get_indexer_metadata(layer_id, forward_batch)
 
         enable_dual_stream = (
             self.alt_stream is not None
@@ -1149,7 +2058,8 @@ class Indexer(MultiPlatformOp):
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            weights = self._project_and_scale_head_gates(x)
+            raw_head_gates = self._project_raw_head_gates(x)
+            head_gates = raw_head_gates * self.n_heads**-0.5
             query, key = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
@@ -1162,7 +2072,7 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
-            weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+            weights = head_gates.unsqueeze(-1) * q_scale * self.softmax_scale
         else:
             query, key = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
@@ -1191,7 +2101,7 @@ class Indexer(MultiPlatformOp):
                 )
 
             # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
-            # fused_rms_fp8_group_quant is passed directly to _get_logits_head_gate,
+            # fused_rms_fp8_group_quant is passed directly to the gate projection,
             # which extracts the bf16 tensor via _weights_proj_bf16_in_fp32_out,
             # completely skipping the FP8 dequantization path below.
             if (
@@ -1231,7 +2141,9 @@ class Indexer(MultiPlatformOp):
             else:
                 x_for_gate = x
 
-            weights = self._get_logits_head_gate(x_for_gate, q_scale)
+            raw_head_gates, weights = self._get_raw_and_logits_head_gate(
+                x_for_gate, q_scale
+            )
 
         if _is_cuda or _is_hip:
             assert forward_batch.seq_lens_cpu is not None
@@ -1257,7 +2169,13 @@ class Indexer(MultiPlatformOp):
                 or forward_batch.forward_mode.is_draft_extend(include_v2=True)
             ):
                 topk_result = self._get_topk_paged(
-                    forward_batch, layer_id, q_fp8, weights, metadata
+                    forward_batch,
+                    layer_id,
+                    q_fp8,
+                    weights,
+                    metadata,
+                    query,
+                    raw_head_gates,
                 )
             else:
                 if (
@@ -1320,6 +2238,11 @@ class Indexer(MultiPlatformOp):
                 layer_id=layer_id,
             )
         return maybe_capture_indexer_topk(layer_id, topk_result)
+
+
+
+
+
 
     def forward_npu(
         self,

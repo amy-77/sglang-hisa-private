@@ -310,6 +310,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
 
+    # Per-request generated-token counts, excluding prompt tokens.  This is
+    # propagated by the scheduler for exact decode-phase policy transitions.
+    generated_lens_cpu: Optional[List[int]] = None
+
     # For logprob
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
@@ -463,6 +467,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
+            generated_lens_cpu=batch.generated_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,

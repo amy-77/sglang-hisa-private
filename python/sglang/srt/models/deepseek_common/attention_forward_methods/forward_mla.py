@@ -7,6 +7,8 @@ import torch
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
+from sglang.srt.layers.attention.nsa import offline_unique_head_router as _offline_router
+from sglang.srt.layers.attention.utils import concat_mla_absorb_q_general
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -334,6 +336,24 @@ class DeepseekMLAForwardMixin:
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
+            )
+
+        router_heads = _offline_router.candidate_head_ids(self.layer_id)
+        if (
+            router_heads is not None
+            and topk_indices is not None
+            and topk_indices.ndim == 3
+        ):
+            if skip_rope_for_nsa_tilelang_fused:
+                raise RuntimeError(
+                    "offline router requires the post-RoPE MLA query; "
+                    "the fused deferred-RoPE path is unsupported"
+                )
+            topk_indices = _offline_router.route_candidates(
+                layer_id=self.layer_id,
+                q_mla=concat_mla_absorb_q_general(q_nope_out, q_pe),
+                candidates=topk_indices,
+                forward_batch=forward_batch,
             )
 
         return (

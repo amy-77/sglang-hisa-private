@@ -1,0 +1,118 @@
+{
+  "format_version": 1,
+  "description": "Seven-layer MISA head-selection + offline-router accuracy canary",
+  "checkpoint": "/workspace/qyl/data/headwise_minmax_e2e/exp5_128k_multidecode_router/training/offline_router_regression_r32/checkpoints/router_all.pt",
+  "checkpoint_sha256": "8292138bca80fa5e70c133865e8a08d2cff3956f76ed68774fef9b81ffbba82c",
+  "oracle_summary": "/workspace/qyl/data/headwise_minmax_e2e/exp5_128k_multidecode_router/oracle_summary.json",
+  "oracle_summary_sha256": "9029a8cc21774738c84c1a55f2914b947e6c5efa4c91c21490fcd7d6158b33a0",
+  "budget": 8,
+  "assignment_mode": "learned",
+  "head_selection_mode": "misa",
+  "misa_chunk_size": 1024,
+  "selected_heads_by_layer": {
+    "0": [
+      56,
+      25,
+      62,
+      35,
+      0,
+      1,
+      2,
+      3
+    ],
+    "2": [
+      17,
+      11,
+      8,
+      43,
+      28,
+      42,
+      35,
+      46
+    ],
+    "7": [
+      6,
+      54,
+      61,
+      14,
+      35,
+      0,
+      1,
+      2
+    ],
+    "15": [
+      55,
+      26,
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "30": [
+      58,
+      15,
+      36,
+      48,
+      14,
+      26,
+      0,
+      1
+    ],
+    "45": [
+      54,
+      12,
+      60,
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "60": [
+      3,
+      7,
+      44,
+      32,
+      0,
+      1,
+      2,
+      4
+    ]
+  },
+  "coverage": {
+    "trained_layers": 7,
+    "deployed_layers": 7,
+    "model_layers_expected": 61,
+    "is_full_layer_coverage": false
+  },
+  "training_config": {
+    "steps": 600,
+    "learning_rate": 0.003,
+    "rank": 32,
+    "temperature": 0.04,
+    "queries_per_prompt": 8,
+    "dynamic_indexer_keys": false,
+    "loss": "regression",
+    "assignment_budget": 0
+  },
+  "train_samples": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ]
+}

@@ -1349,7 +1349,7 @@ class DeepseekV2AttentionMLA(
         self.next_skip_topk = None
         if self.use_nsa:
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
-            self.indexer = Indexer(
+            indexer_kwargs = dict(
                 hidden_size=hidden_size,
                 index_n_heads=get_nsa_index_n_heads(config),
                 index_head_dim=get_nsa_index_head_dim(config),
@@ -1367,6 +1367,8 @@ class DeepseekV2AttentionMLA(
                 layer_id=layer_id,
                 alt_stream=alt_stream,
             )
+
+            self.indexer = Indexer(**indexer_kwargs)
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.

@@ -1941,6 +1941,34 @@ class NSATokenToKVPool(MLATokenToKVPool):
         del self.kv_buffer
         del self.index_k_with_scale_buffer
 
+    # ---- per-chunk index-K sums (per-head paged indexer) ------------------
+
+    def get_index_k_chunk_sum(self, layer_id: int) -> torch.Tensor:
+        """``chunk_sum`` [num_pages * 4, index_head_dim] f32 for a layer
+        (one 16-token chunk sum per quarter page).
+
+        Allocated lazily; only the per-head paged indexer uses it
+        (SGLANG_NSA_PER_HEAD_INDEX=1).  Chunks are reset when their slot-0
+        token is written, so stale chunks never leak into a new request.
+        """
+        if getattr(self, "_index_k_chunk_sum", None) is None:
+            from sglang.srt.layers.attention.nsa import per_head_paged as php
+
+            num_pages = self.index_k_with_scale_buffer[0].shape[0]
+            shape = (num_pages * php.CHUNKS_PER_PAGE, self.index_head_dim)
+            self._index_k_chunk_sum = [
+                torch.zeros(shape, dtype=torch.float32, device=self.device)
+                for _ in range(self.layer_num)
+            ]
+        return self._index_k_chunk_sum[layer_id - self.start_layer]
+
+    def update_index_k_chunk_sum(
+        self, layer_id: int, key: torch.Tensor, loc: torch.Tensor
+    ) -> None:
+        from sglang.srt.layers.attention.nsa.per_head_paged import update_chunk_sum
+
+        update_chunk_sum(self.get_index_k_chunk_sum(layer_id), key, loc)
+
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
@@ -1972,6 +2000,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
 
+
+
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
@@ -2002,6 +2032,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
             seq_len_sum=seq_len_sum,
             max_seq_len=max_seq_len,
         )
+
+
+
+
 
     def set_index_k_scale_buffer(
         self,

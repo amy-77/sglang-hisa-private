@@ -10,12 +10,14 @@ from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.srt.layers.attention.nsa import headmap_probe as _headmap_probe
 from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     NativeSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.nsa.per_head_paged import FLASHMLA_TOPK_BLOCK
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode,
@@ -424,14 +426,16 @@ class NativeSparseAttnBackend(
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         assert forward_batch.seq_lens_cpu is not None
         max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item() + draft_token_num)
+
         # [b, max_seqlen_k]
+        # req_to_token:  [max_running_req, max_context_len]
+        # 一行表示一条request，一列表示当前request的逻辑token 0,1,2...., 对应的物理token号
         page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
         ]
 
         page_table_1_flattened = None
         topk_indices_offset = None
-
         # Centralized dispatch: decide all strategies for this batch
         self.set_nsa_prefill_impl(forward_batch)
         nsa_impl_for_batch = (
@@ -1421,12 +1425,14 @@ class NativeSparseAttnBackend(
         # This handles cases where q is padded (TP + partial DP attention)
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+        per_head = topk_indices is not None and topk_indices.ndim == 3
 
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
         if envs.SGLANG_NSA_FUSE_TOPK.get():
+            assert not per_head, "per-head indices need SGLANG_NSA_FUSE_TOPK=0"
             page_table_1 = topk_indices
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -1438,17 +1444,20 @@ class NativeSparseAttnBackend(
                     if topk_indices_offset.ndim == 1
                     else topk_indices_offset
                 )
+                if per_head:
+                    topk_indices_offset = topk_indices_offset.view(-1, 1, 1)
                 topk_indices = torch.where(
                     mask, topk_indices + topk_indices_offset, topk_indices
                 )
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.nsa_extend_seq_lens_list is not None
+                # per-head: transform [n, G*topk] rows, the map is per token
                 page_table_1 = transform_index_page_table_prefill(
                     page_table=metadata.page_table_1,
-                    topk_indices=topk_indices,
+                    topk_indices=topk_indices.reshape(topk_indices.shape[0], -1),
                     extend_lens_cpu=metadata.nsa_extend_seq_lens_list,
                     page_size=1,
-                )
+                ).view(topk_indices.shape)
 
         # todo hisparse: to cover more backends
         if forward_batch.hisparse_coordinator is not None:
@@ -1456,6 +1465,43 @@ class NativeSparseAttnBackend(
                 forward_batch.token_to_kv_pool.translate_loc_to_hisparse_device(
                     page_table_1
                 )
+            )
+
+        if per_head:
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if nsa_impl == "flashmla_kv":
+                # Every prefill row is one query with its own index list, which
+                # is the same contract decode uses, so the decode per-head
+                # kernel path applies unchanged.  It reads the FP8 store in
+                # place, unlike flashmla_sparse below.
+                return self._forward_flashmla_kv_per_head(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    v_head_dim=layer.v_head_dim,
+                    sm_scale=layer.scaling,
+                    layer=layer,
+                    metadata=metadata,
+                    page_table_1=topk_indices,
+                )
+            if nsa_impl != "flashmla_sparse":
+                raise NotImplementedError(
+                    f"per-head indices: prefill backend {nsa_impl} not supported"
+                )
+            if topk_transform_method == TopkTransformMethod.RAGGED:
+                if any(forward_batch.extend_prefix_lens_cpu):
+                    page_table_1_flattened = self.forward_metadata.page_table_1_flattened
+                    assert page_table_1_flattened is not None
+                    kv_cache = dequantize_k_cache_paged(kv_cache, page_table_1_flattened)
+                else:
+                    kv_cache = _cat([k, k_rope], dim=-1)
+                page_table_1 = topk_indices
+            return self._forward_flashmla_sparse_per_head(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                v_head_dim=layer.v_head_dim,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
             )
 
         if nsa_impl == "tilelang":
@@ -1602,8 +1648,23 @@ class NativeSparseAttnBackend(
         # Align topk_indices with q dimensions
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+        per_head = topk_indices is not None and topk_indices.ndim == 3
+        if (
+            _headmap_probe.enabled()
+            and topk_indices is not None
+            and not per_head
+            and q_rope is not None
+        ):
+            _headmap_probe.maybe_dump_decode(
+                layer,
+                forward_batch,
+                metadata,
+                concat_mla_absorb_q_general(q_nope, q_rope),
+                topk_indices,
+            )
 
         if forward_batch.hisparse_coordinator is not None:
+            assert not per_head, "per-head indices: hisparse is not supported"
             page_table_1 = forward_batch.hisparse_coordinator.swap_in_selected_pages(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -1611,12 +1672,51 @@ class NativeSparseAttnBackend(
                 layer.layer_id,
             )
         elif envs.SGLANG_NSA_FUSE_TOPK.get():
+            assert not per_head, "per-head indices need SGLANG_NSA_FUSE_TOPK=0"
             page_table_1 = topk_indices
         else:
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
-                topk_indices=topk_indices,
+                topk_indices=topk_indices.reshape(topk_indices.shape[0], -1),
                 page_size=1,
+            ).view(topk_indices.shape)
+
+        if per_head:
+            if self.nsa_decode_impl == "flashmla_sparse":
+                if q_rope is not None:
+                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                return self._forward_flashmla_sparse_per_head(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    v_head_dim=layer.v_head_dim,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                )
+            elif self.nsa_decode_impl == "flashmla_kv":
+                if q_rope is not None:
+                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                return self._forward_flashmla_kv_per_head(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    v_head_dim=layer.v_head_dim,
+                    sm_scale=layer.scaling,
+                    layer=layer,
+                    metadata=metadata,
+                    page_table_1=page_table_1,
+                )
+            elif self.nsa_decode_impl == "fa3":
+                return self._forward_fa3_per_head(
+                    q_rope=q_rope,
+                    q_nope=q_nope,
+                    kv_cache=kv_cache,
+                    v_head_dim=layer.v_head_dim,
+                    page_table=page_table_1,
+                    cache_seqlens=metadata.nsa_cache_seqlens_int32,
+                    sm_scale=layer.scaling,
+                    logit_cap=layer.logit_cap,
+                )
+            raise NotImplementedError(
+                f"per-head indices: decode backend {self.nsa_decode_impl} not supported"
             )
 
         if self.nsa_decode_impl == "flashmla_sparse":
@@ -1653,15 +1753,23 @@ class NativeSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif self.nsa_decode_impl == "fa3":
+            # Derive the effective K length from the actual index table. This
+            # equals the model Top-K on normal sparse decode, but also permits
+            # the router's pre-4096 dense warmup table to contain every key.
+            effective_seqlens = (page_table_1 >= 0).sum(
+                dim=-1, dtype=torch.int32
+            )
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
                 v_head_dim=layer.v_head_dim,
                 q_nope=q_nope,
                 page_table=page_table_1,
-                cache_seqlens=metadata.nsa_cache_seqlens_int32,
-                cu_seqlens_q=metadata.nsa_cu_seqlens_q,
-                cu_seqlens_k=metadata.nsa_cu_seqlens_k,
+                cache_seqlens=effective_seqlens,
+                cu_seqlens_q=self.get_device_int32_arange(
+                    effective_seqlens.numel() + 1
+                ),
+                cu_seqlens_k=compute_cu_seqlens(effective_seqlens),
                 max_seqlen_q=metadata.nsa_max_seqlen_q,
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
@@ -2165,6 +2273,8 @@ class NativeSparseAttnBackend(
         # Output: [batch, q_len=1, heads, v_dim] -> [batch, heads, v_dim]
         return out.squeeze(1)
 
+
+
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
@@ -2179,12 +2289,146 @@ class NativeSparseAttnBackend(
 
         pad_size = num_tokens - current_tokens
         padding = torch.full(
-            (pad_size, topk_indices.shape[1]),
+            (pad_size, *topk_indices.shape[1:]),
             -1,
             dtype=topk_indices.dtype,
             device=topk_indices.device,
         )
         return torch.cat([topk_indices, padding], dim=0)
+
+
+
+
+
+    # ---- per-head index contract ([num_tokens, G, topk]) -------------------
+    #
+    # Indexer head g of this rank serves local MLA heads [g*hpg, (g+1)*hpg)
+    # (hpg = 2 for DeepSeek-V3.2: 128 MLA heads / 64 indexer heads).  Every
+    # (token, g) pair becomes one kernel row with its own index set.
+
+    @staticmethod
+    def _per_head_rows(q: torch.Tensor, groups: int) -> torch.Tensor:
+        """[n, h, d] -> [n*G, h/G, d]; heads of one group are contiguous."""
+        n, h, d = q.shape
+        assert h % groups == 0, (
+            f"{h} local MLA heads not divisible by {groups} local indexer heads"
+        )
+        return q.contiguous().view(n * groups, h // groups, d)
+
+    def _forward_flashmla_sparse_per_head(
+        self,
+        q_all: torch.Tensor,  # [n, h, d]
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,  # [n, G, topk]
+        sm_scale: float,
+        rows_per_call: int = 4096,
+    ) -> torch.Tensor:
+        n, h, _ = q_all.shape
+        groups, topk = page_table_1.shape[1], page_table_1.shape[2]
+        q_rows = self._per_head_rows(q_all, groups)
+        idx_rows = page_table_1.reshape(n * groups, topk)
+        out = q_all.new_empty((n * groups, h // groups, v_head_dim))
+        # The kernel pads h/G (=2) query heads to 64; bound the padded q copy.
+        for s in range(0, n * groups, rows_per_call):
+            e = min(s + rows_per_call, n * groups)
+            out[s:e] = self._forward_flashmla_sparse(
+                q_all=q_rows[s:e],
+                kv_cache=kv_cache,
+                v_head_dim=v_head_dim,
+                page_table_1=idx_rows[s:e],
+                sm_scale=sm_scale,
+            )
+        return out.view(n, h, v_head_dim)
+
+
+
+    def _forward_fa3_per_head(
+        self,
+        q_rope: torch.Tensor,  # [n, h, dr]
+        q_nope: torch.Tensor,  # [n, h, dv]
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table: torch.Tensor,  # [n, G, topk] page-1 table
+        cache_seqlens: torch.Tensor,  # [n]
+        sm_scale: float,
+        logit_cap: float,
+    ) -> torch.Tensor:
+        n, h, _ = q_rope.shape
+        groups, topk = page_table.shape[1], page_table.shape[2]
+        # Per-head selectors may intentionally return fewer than the model's
+        # configured Top-K (for example 720 valid entries padded to 2048 with
+        # -1).  Repeating the original clipped sequence length makes FA3 read
+        # those -1 padding entries as physical KV addresses.  Derive the
+        # effective length from each group's compact valid prefix instead.
+        del cache_seqlens
+        seqlens = (page_table >= 0).sum(dim=-1, dtype=torch.int32).reshape(-1)
+        o = self._forward_fa3(
+            q_rope=self._per_head_rows(q_rope, groups),
+            kv_cache=kv_cache,
+            v_head_dim=v_head_dim,
+            q_nope=self._per_head_rows(q_nope, groups),
+            page_table=page_table.reshape(n * groups, topk),
+            cache_seqlens=seqlens,
+            cu_seqlens_q=self.get_device_int32_arange(n * groups + 1),
+            cu_seqlens_k=compute_cu_seqlens(seqlens),
+            max_seqlen_q=1,
+            sm_scale=sm_scale,
+            logit_cap=logit_cap,
+            page_size=1,
+        )
+        return o.view(n, h, v_head_dim)
+
+    def _forward_flashmla_kv_per_head(
+        self,
+        q_all: torch.Tensor,  # [n, h, d]
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        sm_scale: float,
+        layer,
+        metadata: NSAMetadata,
+        page_table_1: torch.Tensor,  # [n, G, topk]
+    ) -> torch.Tensor:
+        from sgl_kernel.flash_mla import flash_mla_with_kvcache
+
+        n, h, d = q_all.shape
+        groups, topk = page_table_1.shape[1], page_table_1.shape[2]
+        # The kernel's real constraint is topk % TOPK_BLOCK_SIZE == 0
+        # (sm90/decode/sparse_fp8 splitkv_mla.cuh), not topk == index_topk, so a
+        # dense-warmup row may carry a table wider than the sparse budget.
+        assert topk % FLASHMLA_TOPK_BLOCK == 0, (
+            f"per-head index width {topk} must be a multiple of "
+            f"{FLASHMLA_TOPK_BLOCK}"
+        )
+        hpg = h // groups
+        q_rows = self._per_head_rows(q_all, groups).view(n * groups, 1, hpg, d)
+        q_input = q_rows.new_zeros((n * groups, 1, self.flashmla_kv_num_q_heads, d))
+        q_input[:, :, :hpg] = q_rows
+        # See _forward_fa3_per_head: the candidate tensor is physically padded
+        # to index_topk, but only its non-negative prefix is valid.
+        cache_seqlens = (
+            (page_table_1 >= 0).sum(dim=-1, dtype=torch.int32).reshape(-1)
+        )
+        fm = self._compute_flashmla_metadata(
+            cache_seqlens=cache_seqlens, seq_len_q=1, topk=topk
+        )
+
+        kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
+        if not self.nsa_kv_cache_store_fp8:
+            kv_cache = quantize_k_cache(kv_cache)
+        o, _ = flash_mla_with_kvcache(
+            q=q_input,
+            k_cache=kv_cache,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=v_head_dim,
+            tile_scheduler_metadata=fm.flashmla_metadata,
+            num_splits=fm.num_splits,
+            softmax_scale=sm_scale,
+            indices=page_table_1.reshape(n * groups, 1, topk),
+            block_table=torch.empty((n * groups, 0), dtype=torch.int32, device=q_all.device),
+            is_fp8_kvcache=True,
+        )
+        return o[:, 0, :hpg, :].reshape(n, h, v_head_dim)
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
@@ -2274,7 +2518,12 @@ class NativeSparseAttnBackend(
             force_unfused_topk=force_unfused,
         )
 
-    def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
+    def _compute_flashmla_metadata(
+        self,
+        cache_seqlens: torch.Tensor,
+        seq_len_q: int,
+        topk: Optional[int] = None,
+    ):
         from sgl_kernel.flash_mla import get_mla_metadata
 
         num_heads_q = self.flashmla_kv_num_q_heads
@@ -2287,7 +2536,7 @@ class NativeSparseAttnBackend(
             num_heads_k=1,
             num_heads_q=num_heads_q,
             is_fp8_kvcache=True,
-            topk=self.nsa_index_topk,
+            topk=self.nsa_index_topk if topk is None else topk,
         )
 
         return NSAFlashMLAMetadata(

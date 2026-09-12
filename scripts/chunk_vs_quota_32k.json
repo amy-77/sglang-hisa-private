@@ -1,0 +1,27 @@
+{
+  "config": {
+    "batch_size": 4,
+    "seq_len": 32768,
+    "indexer_heads": 8,
+    "mla_heads": 16,
+    "quota_k": 720,
+    "quota_padded": 768,
+    "full_chunk_k": 2048
+  },
+  "latency_ms": {
+    "stage0_coarse_bmm": 0.12723840475082399,
+    "A_coarse_plus_expand_2048": 0.3072096109390259,
+    "B_quota_kernel_720": 0.32537920475006105,
+    "B_minus_A_selection_overhead": 0.018169593811035167,
+    "A_flashmla_2048": 0.19574719667434692,
+    "B_flashmla_768": 0.08407999873161316,
+    "A_total_select_plus_attn": 0.5029568076133728,
+    "B_total_select_plus_attn": 0.4094592034816742
+  },
+  "index_stats": {
+    "quota_valid": 8684,
+    "full_valid": 65536
+  },
+  "verdict": "quota_720_faster",
+  "saved_ms": 0.09349760413169861
+}
